@@ -126,3 +126,40 @@ New: docker-compose.yml, docker/*, {Emergency_Request_Service,Rescue_Service}/{D
 
 ### Files changed this session
 Modified: `infra/terraform/{variables,network,alb,iam,versions,ecr,ecs,outputs}.tf`, `scripts/aws-start.sh`, `README.md`, both docs files. New: `infra/terraform/broker.tf`, `docker/mosquitto/{Dockerfile.aws,entrypoint.sh,mosquitto-aws.conf}`, `scripts/aws-url.sh`. **No application `.js` file was touched.**
+
+---
+
+## Session 4 — 2026-09-27
+
+### Requests from the user
+- "Is it automatically scale down after traffic less?" — asked about the still-live Session 3 deployment.
+- "still it's not scaled down after stopped the data populate script too" — reported the actual observed behavior on that live deployment, which turned out to expose a real, previously undiscovered bug.
+- Also asked in this session, answered inline without further action needed: "not able to see ec2 instance from my aws" (answered: the whole stack runs on Fargate, which never appears in the EC2 console — see README's dedicated note) and "how to find [the AWS endpoint] ip and update the same in readme file too" (answered live with `scripts/aws-url.sh`, then documented in the README as its own step).
+
+### Discoveries
+1. **Scale-in has never once succeeded, on any deployment so far, including the ones §13/Session 3 called "verified."** Direct evidence from `aws cloudwatch describe-alarm-history --alarm-name sdr-priority-idle`: every single transition of the alarm into `ALARM` state was immediately followed by `Failed to execute AutoScaling action: Metric data points must be provided`, at 06:21:33, 06:38:33, and 07:14:56 UTC — three separate occurrences before any fix.
+2. **Root cause, confirmed not just theorized:** `sdr-priority-idle` uses `treat_missing_data = "breaching"` so the *alarm* correctly reaches `ALARM` on 10 minutes of silence. But AWS Application Auto Scaling's **Step Scaling** policy type does something different from "did the alarm fire": it reads the metric's actual numeric value to pick a step bracket, and with zero real datapoints in the evaluation window (because Emergency Request Service only ever calls `PutMetricData` when a real request happens, never a `0` during idle — emergency_service.js:42-67, 97), there is nothing for it to read, so AWS refuses to execute the action. This is a hard architectural limitation of Step Scaling + a metric that goes silent, not a timing problem — **no amount of additional waiting would ever have fixed it.**
+3. Also confirmed, as a side effect of digging into this: **the Emergency task's public IP had already changed once** during the still-live deployment (new task ID, fresh boot log at 07:14 UTC — almost certainly a Fargate Spot interruption, since Emergency runs on Spot by default), and there was unexplained real traffic (a fresh 35k + 300k-equivalent event) at 07:19-07:21 UTC that neither script in this session fired — most likely the user testing the endpoint themselves using the address given earlier in conversation. Both are consistent with, and good real-world confirmation of, behavior already documented (the IP-can-change warning, and the endpoint being reachable from outside AWS).
+4. Building the fix surfaced two near-misses that were caught before touching the live system: (a) a plain `terraform plan`/`apply` without pinning `TF_VAR_image_tag` to the tag `aws-start.sh` had actually deployed would have force-replaced all 4 running task definitions (defaulting to `:latest`, which nothing was tagged as, looking like a full image change) and (b) separately would have replaced `aws_service_discovery_service.broker[0]` due to unrelated pre-existing state drift from the `health_check_custom_config` deprecation fix made earlier in Session 3. Both were confirmed via a full `terraform plan` read before any apply, and avoided using `-target` scoped to only the new heartbeat resources plus the correct `TF_VAR_image_tag`.
+
+### The fix
+Added `infra/terraform/heartbeat.tf` and `infra/terraform/lambda/heartbeat.js`: an EventBridge rule firing every 1 minute, invoking a small Lambda that publishes `SmartDisasterRelief/IncomingRequests = 0` — same namespace, metric name, no dimensions, and `StorageResolution = 1` as the real metric, so it's genuinely the same metric stream, not a separate one. **Infrastructure only; no application `.js` file touched**, per the standing constraint. Added the `hashicorp/archive` Terraform provider to zip the Lambda source.
+
+### Actions performed
+- Diagnosed via `aws cloudwatch describe-alarms`, `describe-alarm-history`, `get-metric-statistics`, `application-autoscaling describe-scaling-activities`, and `ecs describe-services` against the live Session 3 deployment — no destructive actions during diagnosis.
+- Asked the user how to handle it (three options: infra-only heartbeat / app-code heartbeat / leave as documented limitation); user chose the infra-only heartbeat.
+- Wrote `heartbeat.tf` + `lambda/heartbeat.js`; added the `archive` provider; ran `terraform fmt`, `init -upgrade`, `validate` (all clean).
+- Ran a full `terraform plan` first and caught the two near-misses in Discovery #4 above before applying anything.
+- Re-ran `terraform plan` with `TF_VAR_image_tag` pinned to the live tag (`20260927122815`, read directly from `aws ecs describe-task-definition`) — plan then showed only the 8 new heartbeat resources plus one pre-existing, unrelated `aws_service_discovery_service.broker[0]` replacement.
+- Applied with `terraform apply -target=...` naming exactly the 8 heartbeat resources, explicitly excluding the service-discovery replacement. Result: `Apply complete! Resources: 8 added, 0 changed, 0 destroyed.` — nothing else on the live system was touched.
+- Verified the Lambda executes cleanly every ~60s (`aws logs tail /aws/lambda/sdr-priority-idle-heartbeat`) and that CloudWatch now shows real `Sum = 0.0` datapoints during idle (`get-metric-statistics`), where previously there were none at all.
+- Confirmed the fix live: the very next alarm evaluation after the heartbeat's first datapoint landed successfully triggered `sdr-priority-scale-in`, reducing Priority from 4 to 3 tasks (`describe-scaling-activities`: `"Successfully set desired count to 3. Change successfully fulfilled by ecs."`) — the first successful scale-in execution across every session so far.
+- User chose to keep watching until it fully drains to the minimum before tearing down. A background poll confirmed the **full drain**: 4→3 at 07:45:56 UTC, 3→2 at ~07:52:08, 2→1 (the configured minimum) at 07:58:14 — one task removed roughly every 5 minutes, matching `scale_in_cooldown` exactly. Scale-in is now proven working end to end, not just for one step.
+- Updated both docs files with the bug, root cause, fix, and full live confirmation (this entry + context doc §14). Added a short note to `README.md` (autoscaling section + project-status section) about the heartbeat fix.
+
+### Open at end of session
+- **The deployment is still live** (now idled down to 1 Priority task + Emergency + Rescue + the test broker, plus the new heartbeat Lambda) — tear down with `bash scripts/aws-terminate.sh` next, per the user's consistent low-cost preference this whole investigation.
+- Real-HiveMQ deployment, and this same scale-in fix validated against it, still untested (no credentials available).
+
+### Files changed this session
+New: `infra/terraform/heartbeat.tf`, `infra/terraform/lambda/heartbeat.js`. Modified: `infra/terraform/versions.tf` (archive provider), `.gitignore` (`infra/terraform/build/`), both docs files, `README.md` (see turns after the fix — confirm final state before treating as done). **No application `.js` file was touched.**

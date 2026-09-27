@@ -11,6 +11,11 @@ terraform {
       source  = "hashicorp/tls"
       version = ">= 4.0"
     }
+    # Zips the scale-in heartbeat Lambda (heartbeat.tf)
+    archive = {
+      source  = "hashicorp/archive"
+      version = ">= 2.0"
+    }
   }
 }
 

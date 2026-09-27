@@ -2,6 +2,9 @@
 
 > Living document. Read this first when resuming. Session-by-session history is in [CLAUDE_INVESTIGATION_LOG.md](CLAUDE_INVESTIGATION_LOG.md).
 > **No application code has been modified.** Investigation only.
+> Last updated: 2026-09-27 (Session 4: found and fixed a real scale-in bug on the live deployment; see §14).
+> **Session 4 headline:** scale-in (automatic scale-DOWN) never worked at all, on any prior deployment, for a concrete AWS reason: Application Auto Scaling's Step Scaling policy needs an actual CloudWatch datapoint to compute a step, and Emergency only publishes `IncomingRequests` when a real request happens — never a `0` during idle. Fixed with a small, infrastructure-only EventBridge+Lambda heartbeat (no app code touched), and the fix was confirmed live: scale-in executed successfully for the first time immediately after the heartbeat started. See §14.
+>
 > Last updated: 2026-09-27 (Session 3: cost-optimized Terraform + optional test broker; real AWS deployment run and verified twice; see §13).
 > **Session 3 headline:** the system was deployed to real AWS (ECS Fargate, ap-southeast-2, throwaway test broker, no HiveMQ needed) and both a 35k and a 300k event completed correctly with autoscaling firing. But the extra Priority tasks arrived too late to meaningfully share the 300k burst: the one warm task did 60% of the work; the last task to join processed almost nothing. This is now measured evidence, not just the local-loopback hypothesis in §12.2. Read §13.2.
 >
@@ -408,3 +411,51 @@ If it says anything other than `INACTIVE` / no services, real AWS resources are 
 2. A real HiveMQ-backed deployment (needs credentials) is still untested — everything measured in §13.2 used the throwaway test broker, so latencies and the scale-out-lag finding should be treated as "true on this architecture," not yet "true on the production broker."
 3. Observing a full scale-in cycle (10 idle minutes → `sdr-priority-idle` alarm → task removed) was proposed but not run this session, to avoid extra idle billing.
 4. If the ap-south-1 requirement becomes firm later, the real fix is making the CloudWatch client's region configurable via an env var in `emergency_service.js` (a one-line, additive app change) rather than living with disabled autoscaling — flag this to the user if it comes up again (see D9).
+
+---
+
+## 14. Scale-in was completely broken on every prior deployment — found and fixed (Session 4)
+
+### 14.1 The bug
+User asked, on the still-live Session 3 deployment: "still it's not scaled down after stopped the data populate script too." Investigating the actual AWS alarm history (not just current state) showed the scale-in path had **never once succeeded**, on any deployment so far, including the ones "verified" in §13:
+
+```
+07:14:56  Alarm updated from INSUFFICIENT_DATA to ALARM
+07:14:56  Failed to execute AutoScaling action: Metric data points must be provided
+06:38:33  Alarm updated from OK to ALARM
+06:38:33  Failed to execute AutoScaling action: Metric data points must be provided
+06:21:33  Alarm updated from INSUFFICIENT_DATA to ALARM
+06:21:33  Failed to execute AutoScaling action: Metric data points must be provided
+```
+
+**Root cause:** `sdr-priority-idle` (autoscaling.tf) uses `treat_missing_data = "breaching"`, which correctly moves the *alarm* to `ALARM` when Emergency has published nothing for 10 minutes (it only ever publishes `IncomingRequests` when a real request happens — never a `0` heartbeat during idle, §4.2). But the alarm firing only triggers the *attempt* to scale in; the actual step-scaling policy execution is a separate AWS Application Auto Scaling call that reads the metric's real numeric value to decide which step bracket applies. With literally zero datapoints in the window, there is nothing to read, and AWS refuses the action outright with `Metric data points must be provided`. This is a hard limitation of Step Scaling, not a timing/cooldown issue — **no amount of waiting would ever have fixed it.** Scale-out never hit this because it only needs to detect crossing a *high* threshold, which missing data can never spuriously trigger, so it always had a real datapoint to act on (§13.2 confirmed scale-out working 3 separate times).
+
+This means the §13 write-up's autoscaling verification was incomplete: scale-**out** was genuinely proven; scale-**in** looked "not yet observed due to cost" when actually it was silently failing every time it was attempted, on the very deployment §13 called "fully run and verified."
+
+### 14.2 The fix
+Added `infra/terraform/heartbeat.tf` (+ `infra/terraform/lambda/heartbeat.js`): a tiny Lambda, triggered by an EventBridge rule every 1 minute, that publishes `SmartDisasterRelief/IncomingRequests = 0` (matching the real metric's namespace/name/no-dimensions/`StorageResolution=1` exactly, so it's the same metric stream). This is **infrastructure only — no application code touched**, consistent with the standing constraint. It gives the alarm and the Step Scaling evaluation a continuous stream of real datapoints during idle, so both the `ALARM` transition and the actual scaling action have something to act on.
+
+Applied to the **live** deployment with `terraform apply -target=...` restricted to only the 8 new heartbeat resources, after first discovering (via a full `terraform plan`) that a plain `terraform apply` would have also force-replaced all 4 running task definitions — because the manual plan didn't have `TF_VAR_image_tag` set to match what `aws-start.sh` had actually deployed, so it defaulted to `:latest` and looked like a full image change — and separately would have replaced `aws_service_discovery_service.broker[0]` (pre-existing state drift from the `health_check_custom_config` deprecation fix earlier in Session 3, unrelated to this fix). Both were avoided by pinning `TF_VAR_image_tag` to the live tag and using `-target` to touch only the heartbeat resources. Neither issue reached the live system.
+
+### 14.3 Confirmed working, live
+| Time (UTC) | Event |
+|---|---|
+| 07:37:56 | Alarm → `ALARM` (10 min idle), scale-in **still fails**: `Metric data points must be provided` (pre-fix, expected) |
+| 07:44 | Heartbeat Lambda deployed; logs confirm it's invoked every ~60s with no errors |
+| 07:44:00 | First real `Sum = 0.0` datapoint appears in CloudWatch (previously: nothing, ever, during idle) |
+| 07:45:56 (13:15:56 IST) | Next alarm evaluation: `sdr-priority-scale-in` policy triggered → **`Successful: "Successfully set desired count to 3."`** — Priority 4 → 3 |
+
+This is the first successful scale-in execution across all sessions. **Full drain confirmed** in the same session, one task removed every ~5 minutes (matching `scale_in_cooldown`), all the way to the configured minimum:
+
+| Time (UTC) | Priority desired count |
+|---|---|
+| 07:45:56 | 4 → 3 |
+| ~07:52:08 | 3 → 2 |
+| 07:58:14 | 2 → **1 (`priority_min_capacity`, floor reached)** |
+
+Scale-in is now proven working end to end, not just theoretically fixed.
+
+### 14.4 Corrected takeaway for §7 / §13
+- **Scale-out was always real; scale-in was never real until this fix.** Anyone reading §13.2's "autoscaling triggers and scales Priority out" should not assume scale-in was equally proven — it wasn't, until this session.
+- More generally: **a CloudWatch alarm built on `treat_missing_data = breaching` is not sufficient by itself to drive a Step Scaling scale-in policy.** Either the source metric must publish real values continuously (including zero), as fixed here, or the scale-in mechanism must not be Step Scaling (e.g. a scheduled action, or target tracking against a metric that behaves better with gaps). Worth remembering for any future ECS+CloudWatch-alarm autoscaling design, not specific to this project.
+- Cost impact of the fix: negligible — one Lambda invocation and one `PutMetricData` call per minute, both well within free-tier volumes for a demo/test deployment.
