@@ -1,0 +1,14 @@
+# Slim variant of ./Dockerfile (node:24 full image, root user, npm install).
+# Smaller image = faster Fargate scale-out. Original Dockerfile is left unchanged.
+FROM node:24-alpine
+
+ENV NODE_ENV=production
+WORKDIR /app
+
+COPY package*.json ./
+RUN npm ci --omit=dev
+
+COPY . .
+
+USER node
+CMD ["node", "Priority_Service.js"]

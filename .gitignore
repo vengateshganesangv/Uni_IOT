@@ -4,3 +4,10 @@ node_modules/
 credentials.docx
 *.docx
 *.pdf
+# Terraform
+infra/terraform/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfplan
+crash.log

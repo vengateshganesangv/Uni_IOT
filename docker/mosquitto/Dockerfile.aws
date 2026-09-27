@@ -1,0 +1,8 @@
+# TEST-ONLY broker image for the optional in-AWS test broker (infra/terraform/broker.tf, var.use_test_broker).
+# Certificates arrive as env vars (from SSM via ECS secrets) and are written to /tmp at start.
+FROM eclipse-mosquitto:2.0
+
+COPY mosquitto-aws.conf /mosquitto/config/mosquitto.conf
+COPY entrypoint.sh /entrypoint.sh
+
+ENTRYPOINT ["/bin/sh", "/entrypoint.sh"]
