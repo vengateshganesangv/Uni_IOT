@@ -146,3 +146,17 @@ variable "log_retention_days" {
   type    = number
   default = 3
 }
+
+# ---- Rescue Service autoscaling ----
+
+variable "rescue_min_capacity" {
+  description = "Minimum number of Rescue Service ECS tasks"
+  type        = number
+  default     = 1
+}
+
+variable "rescue_max_capacity" {
+  description = "Maximum number of Rescue Service ECS tasks"
+  type        = number
+  default     = 4
+}

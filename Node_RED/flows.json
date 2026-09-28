@@ -1,0 +1,177 @@
+[
+    {
+        "id": "615b1c566ad3f3dc",
+        "type": "tab",
+        "label": "Flow 1",
+        "disabled": false,
+        "info": "",
+        "env": []
+    },
+    {
+        "id": "717cd87850c6cee3",
+        "type": "tab",
+        "label": "Flow 2",
+        "disabled": false,
+        "info": "",
+        "env": []
+    },
+    {
+        "id": "745f9f4311e04935",
+        "type": "tls-config",
+        "name": "HiveMQ TLS",
+        "certType": "files",
+        "cert": "",
+        "key": "",
+        "p12": "",
+        "p12name": "",
+        "ca": "",
+        "certname": "",
+        "keyname": "",
+        "caname": "",
+        "servername": "",
+        "verifyservercert": true,
+        "alpnprotocol": "",
+        "certEnv": "",
+        "keyEnv": "",
+        "caEnv": ""
+    },
+    {
+        "id": "a620948fca7f0444",
+        "type": "mqtt-broker",
+        "name": "HiveMQ Cloud",
+        "broker": "1490e7aa531c43e6af66775dcb39171b.s1.eu.hivemq.cloud",
+        "port": "8883",
+        "tls": "745f9f4311e04935",
+        "clientid": "",
+        "autoConnect": true,
+        "usetls": true,
+        "protocolVersion": 4,
+        "keepalive": 60,
+        "cleansession": true,
+        "autoUnsubscribe": true,
+        "birthTopic": "",
+        "birthQos": "0",
+        "birthRetain": "false",
+        "birthPayload": "",
+        "birthMsg": {},
+        "closeTopic": "",
+        "closeQos": "0",
+        "closeRetain": "false",
+        "closePayload": "",
+        "closeMsg": {},
+        "willTopic": "",
+        "willQos": "0",
+        "willRetain": "false",
+        "willPayload": "",
+        "willMsg": {},
+        "userProps": "",
+        "sessionExpiry": ""
+    },
+    {
+        "id": "381a94d9e13d163d",
+        "type": "mqtt in",
+        "z": "615b1c566ad3f3dc",
+        "name": "Water Sensor Data",
+        "topic": "disaster/water/#",
+        "qos": "0",
+        "datatype": "json",
+        "broker": "a620948fca7f0444",
+        "nl": false,
+        "rap": true,
+        "rh": 0,
+        "inputs": 0,
+        "x": 170,
+        "y": 200,
+        "wires": [
+            [
+                "603cd389e61abaa1"
+            ]
+        ]
+    },
+    {
+        "id": "3dc31bfb9d7cc9a6",
+        "type": "debug",
+        "z": "615b1c566ad3f3dc",
+        "name": "debug 1",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "payload",
+        "targetType": "msg",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 880,
+        "y": 420,
+        "wires": []
+    },
+    {
+        "id": "603cd389e61abaa1",
+        "type": "switch",
+        "z": "615b1c566ad3f3dc",
+        "name": "",
+        "property": "payload.value",
+        "propertyType": "msg",
+        "rules": [
+            {
+                "t": "gte",
+                "v": "50",
+                "vt": "str"
+            }
+        ],
+        "checkall": "false",
+        "repair": false,
+        "outputs": 1,
+        "x": 370,
+        "y": 200,
+        "wires": [
+            [
+                "01d0fb5116f04b3f"
+            ]
+        ]
+    },
+    {
+        "id": "01d0fb5116f04b3f",
+        "type": "function",
+        "z": "615b1c566ad3f3dc",
+        "name": "function 1",
+        "func": "const sensorData = msg.payload;\n\nmsg.payload = {\n    location: sensorData.location,\n    waterLevel: sensorData.value,\n    sensorId: sensorData.sensorId,\n\n    eventId: sensorData.eventId,\n    eventStartTime: sensorData.eventStartTime,\n    totalEventRequests: sensorData.totalEventRequests,\n\n    zoneA: sensorData.zoneA,\n    zoneB: sensorData.zoneB,\n    zoneC: sensorData.zoneC\n};\n\nreturn msg;",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 540,
+        "y": 200,
+        "wires": [
+            [
+                "93f67cf22b7d0b9d"
+            ]
+        ]
+    },
+    {
+        "id": "93f67cf22b7d0b9d",
+        "type": "http request",
+        "z": "615b1c566ad3f3dc",
+        "name": "Send to Emergency Service",
+        "method": "POST",
+        "ret": "obj",
+        "paytoqs": "ignore",
+        "url": "http://127.0.0.1:3001/emergency",
+        "tls": "",
+        "persist": false,
+        "proxy": "",
+        "insecureHTTPParser": false,
+        "authType": "",
+        "senderr": false,
+        "headers": [],
+        "x": 740,
+        "y": 200,
+        "wires": [
+            [
+                "3dc31bfb9d7cc9a6"
+            ]
+        ]
+    }
+]

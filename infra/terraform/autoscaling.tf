@@ -95,3 +95,117 @@ resource "aws_cloudwatch_metric_alarm" "priority_in" {
   treat_missing_data  = "breaching" # no datapoints at all = idle
   alarm_actions       = [aws_appautoscaling_policy.priority_in.arn]
 }
+
+# ===================================================================
+# Rescue Service Auto Scaling
+# Rescue workers share MQTT work and use Redis for shared state.
+# ===================================================================
+
+resource "aws_appautoscaling_target" "rescue" {
+  service_namespace  = "ecs"
+  scalable_dimension = "ecs:service:DesiredCount"
+  resource_id        = "service/${aws_ecs_cluster.main.name}/${aws_ecs_service.rescue.name}"
+
+  min_capacity = var.rescue_min_capacity
+  max_capacity = var.rescue_max_capacity
+}
+
+# ---------------- Rescue scale OUT ----------------
+
+resource "aws_appautoscaling_policy" "rescue_out" {
+  name               = "${var.project}-rescue-scale-out"
+  policy_type        = "StepScaling"
+  service_namespace  = aws_appautoscaling_target.rescue.service_namespace
+  scalable_dimension = aws_appautoscaling_target.rescue.scalable_dimension
+  resource_id        = aws_appautoscaling_target.rescue.resource_id
+
+  step_scaling_policy_configuration {
+    adjustment_type         = "ChangeInCapacity"
+    cooldown                = var.scale_out_cooldown
+    metric_aggregation_type = "Maximum"
+
+    dynamic "step_adjustment" {
+      for_each = var.scale_steps
+
+      content {
+        metric_interval_lower_bound = tostring(
+          step_adjustment.value.lower - local.scale_out_threshold
+        )
+
+        metric_interval_upper_bound = (
+          step_adjustment.key + 1 < length(var.scale_steps)
+          ? tostring(
+            var.scale_steps[step_adjustment.key + 1].lower -
+            local.scale_out_threshold
+          )
+          : null
+        )
+
+        scaling_adjustment = step_adjustment.value.add
+      }
+    }
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "rescue_out" {
+  alarm_name        = "${var.project}-rescue-incoming-high"
+  alarm_description = "High incoming workload: add Rescue Service tasks"
+
+  namespace   = "SmartDisasterRelief"
+  metric_name = "IncomingRequests"
+  statistic   = "Sum"
+  period      = 10
+
+  evaluation_periods  = 1
+  datapoints_to_alarm = 1
+
+  threshold           = local.scale_out_threshold
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  treat_missing_data  = "notBreaching"
+
+  alarm_actions = [
+    aws_appautoscaling_policy.rescue_out.arn
+  ]
+}
+
+# ---------------- Rescue scale IN ----------------
+
+resource "aws_appautoscaling_policy" "rescue_in" {
+  name               = "${var.project}-rescue-scale-in"
+  policy_type        = "StepScaling"
+  service_namespace  = aws_appautoscaling_target.rescue.service_namespace
+  scalable_dimension = aws_appautoscaling_target.rescue.scalable_dimension
+  resource_id        = aws_appautoscaling_target.rescue.resource_id
+
+  step_scaling_policy_configuration {
+    adjustment_type         = "ChangeInCapacity"
+    cooldown                = var.scale_in_cooldown
+    metric_aggregation_type = "Maximum"
+
+    step_adjustment {
+      metric_interval_upper_bound = "0"
+      scaling_adjustment          = -1
+    }
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "rescue_in" {
+  alarm_name        = "${var.project}-rescue-idle"
+  alarm_description = "No incoming workload: remove Rescue Service tasks one at a time"
+
+  namespace   = "SmartDisasterRelief"
+  metric_name = "IncomingRequests"
+  statistic   = "Sum"
+  period      = 60
+
+  evaluation_periods  = var.scale_in_idle_minutes
+  datapoints_to_alarm = var.scale_in_idle_minutes
+
+  threshold           = 1
+  comparison_operator = "LessThanThreshold"
+  treat_missing_data  = "breaching"
+
+  alarm_actions = [
+    aws_appautoscaling_policy.rescue_in.arn
+  ]
+}

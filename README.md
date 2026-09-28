@@ -98,8 +98,8 @@ The largest possible event (90/90/90) is **300,000 messages**. Three sensor read
 ```
  Sensor_Device  (simulated water sensors, interactive CLI)          scripts/fire-event.js (trigger script)
         |  MQTT disaster/water/Zone_*                                        |  HTTP POST /emergency
-        |  (nothing in this repo consumes these topics)                      v
-        |                                                   Emergency_Request_Service  (Express :3001)
+        |  (bridged to /emergency by Node_RED/flows.json, or by                v
+        |   scripts/fire-event.js for testing)              Emergency_Request_Service  (Express :3001)
         |                                                     - turns water level into N requests
         |                                                     - publishes N MQTT messages
         |                                                     - sends CloudWatch metric IncomingRequests
@@ -109,17 +109,17 @@ The largest possible event (90/90/90) is **300,000 messages**. Three sensor read
         |                                                     - assigns CRITICAL / HIGH / MEDIUM / LOW
         |                                                              |  MQTT disaster/emergency/prioritized
         |                                                              v
-        |                                                   Rescue_Service  (must run exactly ONE copy)
-        |                                                     - in-memory queue + 50 rescue teams
+        |                                                   Rescue_Service  (scalable: MQTT shared subscription + Redis)
+        |                                                     - shared 50-team pool + event tracking, both in Redis
         |                                                     - prints "FLOOD EVENT RESULT" with total time
         +---------------- all messaging goes through one MQTT broker (HiveMQ Cloud, or Mosquitto locally)
 ```
 
 Read these facts before experimenting:
 - **Priority Service** can run as many copies as you like (MQTT "shared subscription" — a feature that automatically splits incoming messages across however many copies are running).
-- **Rescue Service** keeps its state in memory and must stay at one copy. A second copy would receive every message too and double-count.
-- **The broker is a shared ceiling.** Adding Priority copies does not automatically make things faster (see "[Things worth knowing](#things-worth-knowing-when-you-experiment)").
-- **Sensor to Emergency link:** the interactive sensor publishes to MQTT, but nothing in the repo forwards that to `POST /emergency`. `scripts/fire-event.js` fills that gap by calling `/emergency` directly with the same data the sensor computes.
+- **Rescue Service can also run as many copies as you like.** It uses the same shared-subscription mechanism as Priority, plus a shared Redis store (team pool and per-event progress) instead of keeping state in each copy's own memory, with a lock so only one copy ever prints a given event's final result. Verified locally at the maximum event size (300,000 requests) with 3 Rescue copies: completed correctly with zero errors. This has not yet been verified on AWS.
+- **The broker is a shared ceiling.** Adding Priority or Rescue copies does not automatically make things faster (see "[Things worth knowing](#things-worth-knowing-when-you-experiment)").
+- **Sensor to Emergency link:** the interactive sensor publishes to MQTT, and nothing in this repo automatically bridges that to `POST /emergency` when running the sensor for real. Two things fill that gap: `Node_RED/flows.json` is a real bridge flow (needs Node-RED run separately, and its broker/URL settings edited for your environment first), and `scripts/fire-event.js` calls `/emergency` directly with the same data the sensor computes, for quick local testing without any of that setup.
 
 Deeper analysis (bottlenecks, scaling decisions, measurements, open questions) is in [docs/CLAUDE_PROJECT_CONTEXT.md](docs/CLAUDE_PROJECT_CONTEXT.md). A dated history of what was investigated is in [docs/CLAUDE_INVESTIGATION_LOG.md](docs/CLAUDE_INVESTIGATION_LOG.md).
 
@@ -129,11 +129,12 @@ Deeper analysis (bottlenecks, scaling decisions, measurements, open questions) i
 Sensor_Device/               interactive water sensor simulator (MQTT publisher)
 Emergency_Request_Service/   HTTP API + fan-out generator + CloudWatch metric   (has Dockerfile)
 Priority_Service/            priority classifier, scalable worker               (Dockerfile + Dockerfile.slim)
-Rescue_Service/              rescue dispatcher / result printer                 (has Dockerfile)
-docker-compose.yml           local stack: Mosquitto + the three services
+Rescue_Service/              rescue dispatcher / result printer, scalable       (has Dockerfile)
+Node_RED/                    flows.json: bridges the sensor's MQTT output to POST /emergency
+docker-compose.yml           local stack: Mosquitto + Redis + the three services
 docker/                      local broker config + throwaway TLS certificate generator
 scripts/                     fire-event.js, local-up/down, aws-start/terminate/status/logs
-infra/terraform/             AWS: VPC, ALB, ECR, ECS Fargate, IAM, SSM, autoscaling, alarms
+infra/terraform/             AWS: VPC, ALB, ECR, ECS Fargate, Redis, IAM, SSM, autoscaling, alarms
 docs/                        investigation notes and findings
 ```
 
@@ -188,13 +189,20 @@ docker stats                           # CPU per container while an event runs
 ```
 `Could not send CloudWatch metric: Could not load credentials` in the emergency log is **expected locally** — there's no AWS account involved here, and the app simply catches that error and carries on.
 
-**4. Scale the Priority workers and compare**
+**4. Scale the workers and compare**
 ```bash
 docker compose up -d --scale priority=4 --no-recreate priority
 node scripts/fire-event.js 90 90 90
 docker compose logs rescue | grep "Execution Time"      # newest line is last
 ```
-With 4 workers, each one processes roughly a quarter of the messages (see the `Total Processed` lines in each `docker logs smart-disaster-relief-priority-N`). Watch `docker stats` during a run to see which container is at 100% CPU.
+With 4 Priority workers, each one processes roughly a quarter of the messages (see the `Total Processed` lines in each `docker logs smart-disaster-relief-priority-N`). Watch `docker stats` during a run to see which container is at 100% CPU.
+
+Rescue can be scaled too — either set `RESCUE_REPLICAS` before the initial `docker compose up`, or scale it live the same way:
+```bash
+docker compose up -d --scale rescue=3 --no-recreate rescue
+node scripts/fire-event.js 90 90 90
+docker compose logs rescue | grep "FLOOD EVENT RESULT" -A7   # exactly one block should appear, from whichever replica finished the count first
+```
 
 **5. Optional: try the interactive sensor**
 The sensor connects to the real HiveMQ cluster with credentials from a `.env` file, so it does not work in this local setup. Use `fire-event.js` instead.
@@ -271,6 +279,8 @@ On Windows PowerShell instead of Git Bash: `$env:EMERGENCY_URL = bash scripts/aw
 - If things go quiet for 10 minutes, it removes one worker every 5 minutes until back down to the minimum.
 - Tuning knobs live in [infra/terraform/autoscaling.tf](infra/terraform/autoscaling.tf) and [infra/terraform/variables.tf](infra/terraform/variables.tf). For example, to always keep 4 Priority workers ready: `export TF_VAR_priority_min_capacity=4` before running `aws-start.sh`.
 - **Expect a delay, confirmed by an actual test, not just a theory:** in one real run, a 300,000-message event scaled Priority up to its 4-worker maximum, but the one worker that was *already running before the event started* still ended up handling the majority of the messages (201,000 out of about 335,000) — new workers simply didn't finish starting up in time to take much of the load. Full numbers: [docs/CLAUDE_INVESTIGATION_LOG.md](docs/CLAUDE_INVESTIGATION_LOG.md) (Session 3).
+- **A small extra piece keeps scale-*down* working:** AWS won't remove workers based on "no data at all" — it needs a real number to act on, and Emergency Service only ever reports a number when a real request happens. So a tiny separate Lambda ([infra/terraform/heartbeat.tf](infra/terraform/heartbeat.tf), no application code involved) quietly reports "0" once a minute whenever things are quiet, just so AWS always has something to read. Without it, scale-down silently never happens no matter how long you wait — this was found and fixed on a real deployment; see [docs/CLAUDE_INVESTIGATION_LOG.md](docs/CLAUDE_INVESTIGATION_LOG.md) (Session 4).
+- **Rescue Service autoscales the same way as Priority** (same alarm, same steps, same heartbeat fix). This has been verified locally at full scale (see the architecture section above) but **not yet on AWS** — real network latency and Fargate Spot interruptions haven't been tested with it yet, so treat it as promising but unproven on AWS until someone runs it there.
 
 **6. Tear down when you're done (don't skip this)**
 ```bash
@@ -282,7 +292,7 @@ This deletes everything that was created and then double-checks nothing was left
 
 - **More Priority workers is not automatically faster.** In one local test, a 300k event took about 10-12 seconds with 1 worker and about 23-28 seconds with 4 — the local broker became the bottleneck, so extra workers just added overhead. A production-grade broker may behave differently.
 - **The system doesn't guarantee delivery (MQTT "QoS 0").** If a message gets lost (a worker stopped mid-event, a slow consumer), the event never reports `FLOOD EVENT RESULT`, because the "requests completed" count never reaches the total.
-- **Rescue Service keeps everything in memory.** Restarting it forgets any events that were in progress.
+- **Rescue Service's progress now lives in Redis, not its own memory** — restarting one Rescue copy no longer loses in-progress events, since the others (or Redis itself, if it comes back) still have the state. Redis itself is still a single, non-persistent instance though: if *Redis* is lost, all in-progress event tracking goes with it.
 - **Emergency Service pauses while publishing.** A 100,000-message zone occupies it for about half a second before it can respond to anything else.
 
 Full explanation and numbers: [docs/CLAUDE_PROJECT_CONTEXT.md](docs/CLAUDE_PROJECT_CONTEXT.md).
@@ -310,8 +320,9 @@ Full explanation and numbers: [docs/CLAUDE_PROJECT_CONTEXT.md](docs/CLAUDE_PROJE
 ## Project status and known gaps
 
 - No automated tests, no CI, no login/authentication on the `/emergency` endpoint.
-- The interactive sensor isn't wired up to Emergency Service automatically — use `scripts/fire-event.js` instead.
-- The MQTT broker's address is hard-coded inside every service's source file.
+- The interactive sensor isn't wired up to Emergency Service automatically by default — `Node_RED/flows.json` is a real bridge but needs its broker/URL settings edited for your environment first; `scripts/fire-event.js` is the quick path for testing.
+- The MQTT broker's address is configurable via `MQTT_URL` for Emergency/Priority/Rescue; the interactive sensor still hard-codes it (`mqtts://localhost:8883`).
 - The Terraform state file (`infra/terraform/terraform.tfstate`) stays on your own computer, is git-ignored, and contains sensitive values (like the HiveMQ password if you used one). Never share it.
-- **The AWS deployment path has been fully run and verified twice** (using `--test-broker`, in `ap-southeast-2`): deployed, fired real events (35,000 and 300,000 requests, both completed correctly), confirmed autoscaling actually triggers and adds workers, and confirmed a clean teardown afterward with nothing left running. Full numbers: [docs/CLAUDE_INVESTIGATION_LOG.md](docs/CLAUDE_INVESTIGATION_LOG.md), Sessions 2-3.
-- Not yet tested: a deployment against the real HiveMQ Cloud cluster (needs credentials), and watching a full "scale back down" cycle end to end (needs 10+ minutes of the system sitting idle).
+- **The AWS deployment path has been fully run and verified** (using `--test-broker`, in `ap-southeast-2`): deployed, fired real events (35,000 and 300,000 requests, both completed correctly), confirmed autoscaling actually triggers and adds workers, confirmed a real bug that silently prevented scale-*down* from ever working (fixed with a small heartbeat Lambda, see step 5 above), and confirmed a clean teardown afterward with nothing left running. Full numbers: [docs/CLAUDE_INVESTIGATION_LOG.md](docs/CLAUDE_INVESTIGATION_LOG.md), Sessions 2-4.
+- **Rescue Service was rewritten to be scalable** (shared MQTT subscription + Redis-backed shared state instead of each copy's own memory) and **verified locally at full scale**: 3 Rescue copies completed a 300,000-request event correctly in 22.5 seconds with zero errors. This has only been run locally so far, not on AWS — see [docs/CLAUDE_INVESTIGATION_LOG.md](docs/CLAUDE_INVESTIGATION_LOG.md) Session 5 for the full story, including three real bugs found and fixed along the way.
+- Not yet tested: a deployment against the real HiveMQ Cloud cluster (needs credentials), the Rescue rewrite on AWS, and the Node-RED bridge running live end to end.

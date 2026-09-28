@@ -2,6 +2,12 @@
 
 > Living document. Read this first when resuming. Session-by-session history is in [CLAUDE_INVESTIGATION_LOG.md](CLAUDE_INVESTIGATION_LOG.md).
 > **No application code has been modified.** Investigation only.
+> Last updated: 2026-09-28 (Session 5: Rescue Service scalability rewrite reviewed, fixed, and **verified end-to-end at full scale**; see §15).
+> **Session 5 headline:** Rescue Service was rewritten (by the user/a collaborator, not this session) to fix its scalability limitation — shared MQTT subscription + Redis-backed shared state. This session reviewed it, found and fixed four real bugs (see §15), and **confirmed the fix works**: a real local run with 3 Rescue replicas completed a 300,000-request event in 22.5 seconds with zero errors and exactly one printed result. **§4.4/§6/§7's "Rescue must stay at 1" conclusion is now superseded** for the code as it stands after this session's fixes — see §15 for the caveats that still apply (local-only, test-broker MQTT, not yet run on AWS).
+>
+> Last updated: 2026-09-27 (Session 4: found and fixed a real scale-in bug on the live deployment; see §14).
+> **Session 4 headline:** scale-in (automatic scale-DOWN) never worked at all, on any prior deployment, for a concrete AWS reason: Application Auto Scaling's Step Scaling policy needs an actual CloudWatch datapoint to compute a step, and Emergency only publishes `IncomingRequests` when a real request happens — never a `0` during idle. Fixed with a small, infrastructure-only EventBridge+Lambda heartbeat (no app code touched), and the fix was confirmed live: scale-in executed successfully for the first time immediately after the heartbeat started. See §14.
+>
 > Last updated: 2026-09-27 (Session 3: cost-optimized Terraform + optional test broker; real AWS deployment run and verified twice; see §13).
 > **Session 3 headline:** the system was deployed to real AWS (ECS Fargate, ap-southeast-2, throwaway test broker, no HiveMQ needed) and both a 35k and a 300k event completed correctly with autoscaling firing. But the extra Priority tasks arrived too late to meaningfully share the 300k burst: the one warm task did 60% of the work; the last task to join processed almost nothing. This is now measured evidence, not just the local-loopback hypothesis in §12.2. Read §13.2.
 >
@@ -408,3 +414,99 @@ If it says anything other than `INACTIVE` / no services, real AWS resources are 
 2. A real HiveMQ-backed deployment (needs credentials) is still untested — everything measured in §13.2 used the throwaway test broker, so latencies and the scale-out-lag finding should be treated as "true on this architecture," not yet "true on the production broker."
 3. Observing a full scale-in cycle (10 idle minutes → `sdr-priority-idle` alarm → task removed) was proposed but not run this session, to avoid extra idle billing.
 4. If the ap-south-1 requirement becomes firm later, the real fix is making the CloudWatch client's region configurable via an env var in `emergency_service.js` (a one-line, additive app change) rather than living with disabled autoscaling — flag this to the user if it comes up again (see D9).
+
+---
+
+## 14. Scale-in was completely broken on every prior deployment — found and fixed (Session 4)
+
+### 14.1 The bug
+User asked, on the still-live Session 3 deployment: "still it's not scaled down after stopped the data populate script too." Investigating the actual AWS alarm history (not just current state) showed the scale-in path had **never once succeeded**, on any deployment so far, including the ones "verified" in §13:
+
+```
+07:14:56  Alarm updated from INSUFFICIENT_DATA to ALARM
+07:14:56  Failed to execute AutoScaling action: Metric data points must be provided
+06:38:33  Alarm updated from OK to ALARM
+06:38:33  Failed to execute AutoScaling action: Metric data points must be provided
+06:21:33  Alarm updated from INSUFFICIENT_DATA to ALARM
+06:21:33  Failed to execute AutoScaling action: Metric data points must be provided
+```
+
+**Root cause:** `sdr-priority-idle` (autoscaling.tf) uses `treat_missing_data = "breaching"`, which correctly moves the *alarm* to `ALARM` when Emergency has published nothing for 10 minutes (it only ever publishes `IncomingRequests` when a real request happens — never a `0` heartbeat during idle, §4.2). But the alarm firing only triggers the *attempt* to scale in; the actual step-scaling policy execution is a separate AWS Application Auto Scaling call that reads the metric's real numeric value to decide which step bracket applies. With literally zero datapoints in the window, there is nothing to read, and AWS refuses the action outright with `Metric data points must be provided`. This is a hard limitation of Step Scaling, not a timing/cooldown issue — **no amount of waiting would ever have fixed it.** Scale-out never hit this because it only needs to detect crossing a *high* threshold, which missing data can never spuriously trigger, so it always had a real datapoint to act on (§13.2 confirmed scale-out working 3 separate times).
+
+This means the §13 write-up's autoscaling verification was incomplete: scale-**out** was genuinely proven; scale-**in** looked "not yet observed due to cost" when actually it was silently failing every time it was attempted, on the very deployment §13 called "fully run and verified."
+
+### 14.2 The fix
+Added `infra/terraform/heartbeat.tf` (+ `infra/terraform/lambda/heartbeat.js`): a tiny Lambda, triggered by an EventBridge rule every 1 minute, that publishes `SmartDisasterRelief/IncomingRequests = 0` (matching the real metric's namespace/name/no-dimensions/`StorageResolution=1` exactly, so it's the same metric stream). This is **infrastructure only — no application code touched**, consistent with the standing constraint. It gives the alarm and the Step Scaling evaluation a continuous stream of real datapoints during idle, so both the `ALARM` transition and the actual scaling action have something to act on.
+
+Applied to the **live** deployment with `terraform apply -target=...` restricted to only the 8 new heartbeat resources, after first discovering (via a full `terraform plan`) that a plain `terraform apply` would have also force-replaced all 4 running task definitions — because the manual plan didn't have `TF_VAR_image_tag` set to match what `aws-start.sh` had actually deployed, so it defaulted to `:latest` and looked like a full image change — and separately would have replaced `aws_service_discovery_service.broker[0]` (pre-existing state drift from the `health_check_custom_config` deprecation fix earlier in Session 3, unrelated to this fix). Both were avoided by pinning `TF_VAR_image_tag` to the live tag and using `-target` to touch only the heartbeat resources. Neither issue reached the live system.
+
+### 14.3 Confirmed working, live
+| Time (UTC) | Event |
+|---|---|
+| 07:37:56 | Alarm → `ALARM` (10 min idle), scale-in **still fails**: `Metric data points must be provided` (pre-fix, expected) |
+| 07:44 | Heartbeat Lambda deployed; logs confirm it's invoked every ~60s with no errors |
+| 07:44:00 | First real `Sum = 0.0` datapoint appears in CloudWatch (previously: nothing, ever, during idle) |
+| 07:45:56 (13:15:56 IST) | Next alarm evaluation: `sdr-priority-scale-in` policy triggered → **`Successful: "Successfully set desired count to 3."`** — Priority 4 → 3 |
+
+This is the first successful scale-in execution across all sessions. **Full drain confirmed** in the same session, one task removed every ~5 minutes (matching `scale_in_cooldown`), all the way to the configured minimum:
+
+| Time (UTC) | Priority desired count |
+|---|---|
+| 07:45:56 | 4 → 3 |
+| ~07:52:08 | 3 → 2 |
+| 07:58:14 | 2 → **1 (`priority_min_capacity`, floor reached)** |
+
+Scale-in is now proven working end to end, not just theoretically fixed.
+
+### 14.4 Corrected takeaway for §7 / §13
+- **Scale-out was always real; scale-in was never real until this fix.** Anyone reading §13.2's "autoscaling triggers and scales Priority out" should not assume scale-in was equally proven — it wasn't, until this session.
+- More generally: **a CloudWatch alarm built on `treat_missing_data = breaching` is not sufficient by itself to drive a Step Scaling scale-in policy.** Either the source metric must publish real values continuously (including zero), as fixed here, or the scale-in mechanism must not be Step Scaling (e.g. a scheduled action, or target tracking against a metric that behaves better with gaps). Worth remembering for any future ECS+CloudWatch-alarm autoscaling design, not specific to this project.
+- Cost impact of the fix: negligible — one Lambda invocation and one `PutMetricData` call per minute, both well within free-tier volumes for a demo/test deployment.
+
+---
+
+## 15. Rescue Service scalability rewrite — reviewed and fixed, not yet verified end-to-end (Session 5)
+
+### 15.1 What changed (not authored by this session — staged by the user/a collaborator, then reviewed here)
+A large diff (~907 insertions across 15 files) landed as staged changes, framed as "changes to scale Rescue service." It actually does more than that — full details below and in the [investigation log](CLAUDE_INVESTIGATION_LOG.md) Session 5 entry. In short:
+
+- **Rescue Service** ([rescue_service.js](../Rescue_Service/rescue_service.js)) now subscribes via `$share/rescue-workers/disaster/emergency/prioritized` (was a plain subscription — the root cause documented in §4.4) and stores all state in Redis instead of process memory: the 50-team pool as Redis lists, each flood event as a Redis hash, the completed counter via atomic `hIncrBy`, and a `SET NX` lock so only one worker across the whole fleet prints the final `FLOOD EVENT RESULT`. **This directly implements the fix this document proposed in §4.4 and §7.6 #4.**
+- **All four services** moved from a hard-coded HiveMQ hostname + separate `HIVEMQ_USERNAME`/`HIVEMQ_PASSWORD` env vars to a single `MQTT_URL` connection string (Sensor hard-codes `localhost:8883`; the other three default to `localhost:8883` and expect `MQTT_URL` to be set in any other environment).
+- **`Node_RED/flows.json`** (new) is a real bridge from the sensor's `disaster/water/#` MQTT topic to `POST /emergency` — **this closes Open Question #1**, open since Session 1, and its mapping function correctly fixes the `value`→`waterLevel` field-name mismatch flagged back then.
+- **Redis** added to both `docker-compose.yml` (local) and a new `infra/terraform/redis.tf` (AWS: a single Fargate task, Cloud Map private DNS `redis.redis.local`, no persistence, no replication — deliberately simple, matching the project's existing "throwaway state" pattern for the test broker).
+- **`infra/terraform/autoscaling.tf`** gained a Rescue scale-out/scale-in pair mirroring Priority's, on the same `IncomingRequests` metric — and, because it reuses that metric, **automatically inherits the Session 4 heartbeat fix** for scale-in, without needing a second heartbeat.
+- `docker-compose.yml` gained `RESCUE_REPLICAS` (mirroring the existing `PRIORITY_REPLICAS` pattern).
+
+### 15.2 What this session found and fixed
+Full detail in the [investigation log](CLAUDE_INVESTIGATION_LOG.md) Session 5 entry; summary (all four in `Rescue_Service/rescue_service.js` unless noted):
+
+| # | Finding | Severity | Status |
+|---|---|---|---|
+| 1 | Untracked `workers.zip.zip` in the repo root contained a real `.env` with actual HiveMQ credentials, plus `node_modules/` | Secret-leak risk (not yet committed, but one `git add -A` away) | **Deleted** |
+| 2 | `getAvailableTeam()` used one shared Redis connection for a blocking `BLPOP`, called concurrently by every worker for every emergency type. A blocking command occupies its connection until it resolves, so a stuck/exhausted team type could stall checkouts of a completely different, freely-available type | Real concurrency bug — reproduced with real Redis: a free-type checkout took 3041ms instead of ~0ms when queued behind a stuck type on the shared connection | **Fixed**: replaced with non-blocking `LPOP` + bounded retry (25ms/30s). Verified fixed (2ms) and safe under load (200 concurrent checkout/release cycles against 10 teams: 200/200 completed, exactly 10 left in the pool) |
+| 3 | `infra/terraform/ecs.tf`/`iam.tf`: the diff removed `HIVEMQ_USERNAME`/`HIVEMQ_PASSWORD`, but only ever set the new `MQTT_URL` when `use_test_broker = true` — the real-HiveMQ deployment path had no way to configure a broker address or credentials at all | Broken deployment path (real-HiveMQ, still never tested on AWS per §13/§14, but was previously correctly wired) | **Fixed**: one combined SSM SecureString parameter (`aws_ssm_parameter.hivemq_mqtt_url`, storing `mqtts://user:pass@host:8883`) wired in as a `secrets` entry for the non-test-broker case. Verified mqtt.js parses credentials from a URL this way; `terraform validate`/`plan` clean in both modes |
+| 4 | Once fixes 1-3 were applied and load-tested locally, a real **throughput ceiling** surfaced under a 35,000-message burst: `initialiseFloodEvent` did 6 sequential Redis round trips per message (not just the first), and `checkEventComplete` did a full `hGetAll` on every message just to read a value already present on the incoming MQTT message. Combined with only 50 teams total and real (non-zero) per-request Redis latency where the original design had none, this created a self-reinforcing congestion collapse under heavy concurrent load: thousands of concurrent `processRequest()` calls, most polling every 25ms against empty team pools, crowded out the few actually making progress. Manifested as ~30,000+ "No `<type>` team became available within 30000ms" errors and the event never completing | Real throughput bug (not data loss/corruption - errors were honest timeouts, not silent failures), diagnosed by process of elimination: an isolated Redis-only repro at the same 35k concurrency found nothing, so the real container was instrumented directly (per-operation timing/error labels) until the actual failure mode (plain timeout, not a Redis client issue) was confirmed | **Fixed**, three changes: (a) `initialiseFloodEvent` cut from 6 sequential round trips to 2 concurrent ones (5 static fields safely written unconditionally - identical value every time for a given event - one mutable field kept `hSetNX`); (b) `checkEventComplete` compares against `request.totalEventRequests` (already in memory) instead of an eager `hGetAll`, which now only runs once, at actual completion; (c) added a local in-process concurrency limiter (`MAX_CONCURRENT_REQUESTS = 200`) so a burst queues cheaply in memory instead of flooding Redis with concurrent polling. **Verified**: the exact 35k scenario that failed twice went from ~30,000 errors and 0 completions to **35,000/35,000 completed in 3.697s, 0 errors**; the full 300,000-request maximum event completed in **22.489s, 0 errors**, both with exactly one `FLOOD EVENT RESULT` printed (once by `rescue-2`, once by `rescue-1` on the next run - confirming the dedup lock works regardless of which replica wins) |
+
+### 15.3 Explicitly not fixed / not this session's call
+- `ca.crt` (new, at repo root): a public throwaway CA certificate (no private key - not a secret by itself), but generated/ephemeral material that arguably shouldn't be committed. Flagged, left in place.
+- `water_sensor.js`'s unconditional `rejectUnauthorized: false` (fine for the local/test broker; would silently accept any certificate if ever pointed at something else).
+- `redis.tf`'s Redis task has `assign_public_ip = true` despite needing no inbound access from outside the VPC.
+- `Node_RED/flows.json`'s HTTP request node hardcodes `http://127.0.0.1:3001/emergency` - only correct if Node-RED runs co-located with Emergency Service on the same host/network namespace; would need editing (e.g. to `http://emergency:3001/emergency`) to run inside the `docker-compose` network. Its `mqtt-broker` node is also wired for the real HiveMQ Cloud host with no CA override (`verifyservercert: true`, empty `ca` field) - correct for a real public-CA-signed broker, but would fail TLS verification against the local throwaway-CA test broker without edits.
+
+### 15.4 What was actually verified, and what wasn't
+**Verified, with real infrastructure, this session:**
+- The Redis connection fix (#2 above), standalone against real Redis.
+- **The full pipeline end to end, locally, at both a mid-size (35k) and the true maximum (300k) event, with 3 Rescue replicas and `use_test_broker`-equivalent local Mosquitto**: correct completion counts, zero errors, exactly one result printed per event, work distributed across different replicas across runs.
+- The Node-RED bridge's field-mapping function in isolation (extracted and run standalone against a realistic sensor payload) - confirmed it correctly maps `value`→`waterLevel` and produces the expected request-count tier.
+
+**Not verified:**
+- Node-RED itself was not actually started/run this session (see §15.3's two Node-RED caveats - it isn't configured to run inside this project's `docker-compose` network or against the local test broker as-is).
+- Nothing was re-deployed to AWS this session. The Session 3-style load test (real ECS Fargate, real network latency, real Fargate Spot behavior) has not been repeated with this Rescue redesign. Local Docker Desktop performance characteristics (this session's 22.5s-for-300k result) should not be assumed to hold on AWS.
+- The real HiveMQ Cloud broker was not used (still no credentials available this session) - both the original `use_test_broker` path and this session's real-HiveMQ Terraform fix remain unverified against the actual production broker.
+
+### 15.5 Next steps
+1. Update the README's architecture section and troubleshooting notes to describe Rescue as scalable (superseded by this session - do this before the next session, it wasn't completed as of this doc update... check the actual repo state before assuming).
+2. Run Node-RED for real: fix its hardcoded URL/broker config for whichever environment it's tested in, then confirm a real sensor entry flows all the way through to a printed result.
+3. Repeat the Session 3-style AWS load test (test-broker mode, real ECS Fargate) with `RESCUE_REPLICAS`/multiple Rescue tasks, now that the local version is proven - AWS network latency and Fargate Spot interruptions are a materially different environment than local Docker Desktop.
+4. Decide on the four "not fixed" items in §15.3.
+5. If a real HiveMQ account becomes available, re-verify both broker paths against it.

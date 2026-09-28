@@ -11,3 +11,7 @@ infra/terraform/.terraform/
 *.tfvars
 *.tfplan
 crash.log
+
+infra/terraform/build/
+
+**/tfplan

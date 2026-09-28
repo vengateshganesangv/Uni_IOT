@@ -1,12 +1,9 @@
 require("dotenv").config();
 const mqtt = require("mqtt");
 
+// Connect to the MQTT broker configured for this environment
 const client = mqtt.connect(
-    "mqtts://1490e7aa531c43e6af66775dcb39171b.s1.eu.hivemq.cloud:8883",
-    {
-        username: process.env.HIVEMQ_USERNAME,
-        password: process.env.HIVEMQ_PASSWORD
-    }
+    process.env.MQTT_URL || "mqtts://localhost:8883"
 );
 
 let counts = {
@@ -39,9 +36,12 @@ client.on("connect", () => {
 
     console.log("Priority Service connected to MQTT");
 
-    client.subscribe("$share/priority-workers/disaster/emergency/requests", () => {
-        console.log("Waiting for emergency requests...");
-    });
+    client.subscribe(
+        "$share/priority-workers/disaster/emergency/requests",
+        () => {
+            console.log("Waiting for emergency requests...");
+        }
+    );
 });
 
 client.on("message", (topic, message) => {
