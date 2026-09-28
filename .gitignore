@@ -13,3 +13,5 @@ infra/terraform/.terraform/
 crash.log
 
 infra/terraform/build/
+
+**/tfplan

@@ -22,7 +22,7 @@ resource "aws_iam_role_policy_attachment" "execution_managed" {
 data "aws_iam_policy_document" "execution_ssm" {
   statement {
     actions   = ["ssm:GetParameters"]
-    resources = [aws_ssm_parameter.hivemq_username.arn, aws_ssm_parameter.hivemq_password.arn]
+    resources = [aws_ssm_parameter.hivemq_mqtt_url.arn]
   }
 }
 
@@ -56,33 +56,27 @@ resource "aws_iam_role_policy" "emergency_metrics" {
   policy = data.aws_iam_policy_document.emergency_metrics.json
 }
 
-# HiveMQ credentials live in SSM SecureString (free, unlike Secrets Manager). NOTE: the values are also
-# stored in Terraform state, so keep the state file private (it is git-ignored).
+# The services connect using a single MQTT_URL (mqtt.js parses "mqtts://user:pass@host:port" itself -
+# verified directly against the installed mqtt package: connect() correctly extracts options.username/
+# options.password from a URL in this form). Stored combined, as one SSM SecureString (free, unlike Secrets
+# Manager), so only one secret needs wiring into each task instead of assembling it from two. NOTE: the
+# value is also stored in Terraform state, so keep the state file private (it is git-ignored).
 #
-# With use_test_broker the credentials are ignored by the broker (anonymous allowed) but the services still
-# read the env vars, so a placeholder is stored (SSM rejects empty values).
-resource "aws_ssm_parameter" "hivemq_username" {
-  name  = "/${var.project}/hivemq/username"
-  type  = "SecureString"
-  value = var.hivemq_username != "" ? var.hivemq_username : "unused"
+# With use_test_broker this parameter is never read (ecs.tf sets MQTT_URL as a plain env var instead, since
+# the test broker allows anonymous connections), but SSM rejects an empty value, so a placeholder is stored.
+resource "aws_ssm_parameter" "hivemq_mqtt_url" {
+  name = "/${var.project}/hivemq/mqtt_url"
+  type = "SecureString"
+  value = (
+    var.use_test_broker
+    ? "unused"
+    : "mqtts://${var.hivemq_username}:${var.hivemq_password}@${local.broker_host}:8883"
+  )
 
   lifecycle {
     precondition {
-      condition     = var.use_test_broker || var.hivemq_username != ""
-      error_message = "hivemq_username is required unless use_test_broker = true."
-    }
-  }
-}
-
-resource "aws_ssm_parameter" "hivemq_password" {
-  name  = "/${var.project}/hivemq/password"
-  type  = "SecureString"
-  value = var.hivemq_password != "" ? var.hivemq_password : "unused"
-
-  lifecycle {
-    precondition {
-      condition     = var.use_test_broker || var.hivemq_password != ""
-      error_message = "hivemq_password is required unless use_test_broker = true."
+      condition     = var.use_test_broker || (var.hivemq_username != "" && var.hivemq_password != "")
+      error_message = "hivemq_username and hivemq_password are required unless use_test_broker = true."
     }
   }
 }

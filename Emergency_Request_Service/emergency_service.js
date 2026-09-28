@@ -16,12 +16,9 @@ const cloudwatch = new CloudWatchClient({
     region: "ap-southeast-2"
 });
 
+// Connect to the MQTT broker configured for this environment
 const client = mqtt.connect(
-    "mqtts://1490e7aa531c43e6af66775dcb39171b.s1.eu.hivemq.cloud:8883",
-    {
-        username: process.env.HIVEMQ_USERNAME,
-        password: process.env.HIVEMQ_PASSWORD
-    }
+    process.env.MQTT_URL || "mqtts://localhost:8883"
 );
 
 client.on("connect", () => {
